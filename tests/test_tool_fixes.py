@@ -497,3 +497,165 @@ def test_grammar_auto_tools_real_tokenizer(monkeypatch):
         con().advance(ids(bad))
     with pytest.raises(grammar.GrammarError):                              # an unknown tool name
         con().advance(ids(["<tool_call>", "nope", "<arg_key>"]))
+
+
+# -- patches/0690: a GLM call the model's end token left open; a lost <arg_key> ---------------------------------------
+
+open_call = pytest.mark.skipif(not hasattr(server, "close_glm_call"), reason="patches/0690 not applied")
+OPEN = CALL[:-2]                        # the value "Paris" open: no </arg_value>, no </tool_call>
+READ = [{"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {
+    "path": {"type": "string"}, "mode": {"type": "string"}}}}}]
+
+
+def _streamed(deltas):
+    return "".join(d.get("content", "") for d in deltas)
+
+
+def _no_markup(result, deltas):
+    texts = [result["content"], _streamed(deltas), str(result["final"].get("content", ""))]
+    return not any("<tool_call>" in t or "<arg_" in t for t in texts)
+
+
+def test_knob_names_0690():
+    assert {"opencalls", "argkeys"} <= tool_fixes("all")
+    assert tool_fixes("opencalls,argkeys") == {"opencalls", "argkeys"}
+
+
+@open_call
+@pytest.mark.parametrize("end", ["<|observation|>", "<eos>"])
+@pytest.mark.parametrize("thinking", [False, True])
+def test_end_token_inside_an_open_call_returns_the_call(monkeypatch, end, thinking):
+    pieces = (["Check.", "</think>"] if thinking else []) + ["Let me look."] + OPEN + [end]
+    body = dict(THINK if thinking else {}, messages=[{"role": "user", "content": "q"}], tools=TOOLS)
+    before, before_deltas = run(make_app(pieces, ""), copy.deepcopy(body))        # knob off: as before
+    assert before["calls"] is None and before["finish"] == "stop"
+    assert before["content"] == "Let me look." + "".join(OPEN)                   # the markup as text, never dropped
+    monkeypatch.setenv("GLM53_TF_TOOL_FIXES", "opencalls")
+    result, deltas = run(make_app(pieces, "opencalls"), copy.deepcopy(body))
+    assert result["finish"] == "tool_calls" and len(result["calls"]) == 1
+    assert result["calls"][0]["function"]["name"] == "get_weather" and args(result["calls"][0]) == {"city": "Paris"}
+    assert result["content"] == "Let me look." and _streamed(deltas) == "Let me look."   # non-streamed and streamed
+    assert _no_markup(result, deltas)
+    assert result["reasoning"] == ("Check." if thinking else "")
+
+
+@open_call
+def test_end_token_after_a_closed_value_or_a_bare_name(monkeypatch):
+    monkeypatch.setenv("GLM53_TF_TOOL_FIXES", "opencalls")
+    result, _ = run(make_app(CALL[:-1] + ["<eos>"], "opencalls"), {"messages": [], "tools": TOOLS})
+    assert result["finish"] == "tool_calls" and args(result["calls"][0]) == {"city": "Paris"}
+    result, _ = run(make_app(["<tool_call>", "get_weather", "<eos>"], "opencalls"), {"messages": [], "tools": TOOLS})
+    assert result["finish"] == "tool_calls" and args(result["calls"][0]) == {}
+    # a complete call, then an open one: both
+    two = CALL + ["<tool_call>", "set_reminder", "<arg_key>", "message", "</arg_key>", "<arg_value>", "x", "<eos>"]
+    result, _ = run(make_app(two, "opencalls"), {"messages": [], "tools": TOOLS})
+    assert [c["function"]["name"] for c in result["calls"]] == ["get_weather", "set_reminder"]
+
+
+@open_call
+@pytest.mark.parametrize("inside", [
+    ["<tool_call>", "get_weather", "<arg_key>", "ci"],                       # inside a key
+    ["<tool_call>", "get_weather", "<arg_key>", "city", "</arg_key>"],       # a key without its value
+    ["<tool_call>", "no_such_tool", "<arg_key>", "city", "</arg_key>", "<arg_value>", "Paris"],     # not offered
+    ["<tool_call>", "get_weather", " then", "<arg_key>", "city", "</arg_key>", "<arg_value>", "x"],    # name + text
+    ["<tool_call>", "get_weather", "<arg_key>", "city", "</arg_key>", "<arg_value>", "x", "</arg_value>", "stray"],
+    ["<tool_call>", '{"name": "get_weather", "arguments": {"city": "Paris"}}'],                    # not GLM markup
+])
+def test_end_token_inside_an_unparseable_call_keeps_its_markup(monkeypatch, inside):
+    pieces = ["Hm."] + inside + ["<|observation|>"]
+    body = {"messages": [{"role": "user", "content": "q"}], "tools": TOOLS}
+    before, _ = run(make_app(pieces, ""), copy.deepcopy(body))
+    monkeypatch.setenv("GLM53_TF_TOOL_FIXES", "opencalls")
+    result, deltas = run(make_app(pieces, "opencalls"), copy.deepcopy(body))
+    assert result["calls"] is None and result["finish"] == "stop"
+    assert result["content"] == "Hm." + "".join(inside) == before["content"]       # as text, not dropped
+    assert _streamed(deltas) + result["final"].get("content", "") == result["content"]
+
+
+@open_call
+def test_token_limit_inside_a_call_is_unchanged(monkeypatch):
+    pieces = ["Let me look."] + OPEN                         # no end token: the token limit cut the reply
+    body = {"messages": [{"role": "user", "content": "q"}], "tools": TOOLS}
+    before, before_deltas = run(make_app(pieces, ""), copy.deepcopy(body))
+    monkeypatch.setenv("GLM53_TF_TOOL_FIXES", "all")
+    result, deltas = run(make_app(pieces, "all"), copy.deepcopy(body))
+    assert result["finish"] == "length" and result["calls"] is None
+    assert (result["content"], result["final"], deltas) == (before["content"], before["final"], before_deltas)
+
+
+@open_call
+def test_stop_string_ending_the_reply_before_a_call_is_unchanged(monkeypatch):
+    """A drafted round brings several tokens: the stop string, then an open call and the end token. The stop string
+    ended the reply (the call after it is cut), so nothing is closed."""
+
+    def app_for(raw):
+        app = make_app([], raw)
+        app.engine.chunks = [[app.tok.id(p) for p in ["Done.", " STOP"] + OPEN + ["<eos>"]]]
+        return app
+
+    body = {"messages": [{"role": "user", "content": "q"}], "tools": TOOLS, "stop": ["STOP"]}
+    before, before_deltas = run(app_for(""), copy.deepcopy(body))
+    assert before["finish"] == "stop" and before["calls"] is None and before["content"] == "Done."
+    monkeypatch.setenv("GLM53_TF_TOOL_FIXES", "all")
+    result, deltas = run(app_for("all"), copy.deepcopy(body))
+    assert (result["content"], result["calls"], result["finish"], result["completion_tokens"], deltas) == \
+        (before["content"], before["calls"], before["finish"], before["completion_tokens"], before_deltas)
+
+
+@open_call
+def test_stop_string_text_inside_a_call_does_not_stop_it(monkeypatch):
+    """0160's stop strings match the visible answer only, never a call's markup, so a stop string written inside the
+    open call did not end the reply: the end token did, and the call is closed."""
+
+    pieces = ["<tool_call>", "set_reminder", "<arg_key>", "message", "</arg_key>", "<arg_value>", "say STOP", "<eos>"]
+    body = {"messages": [{"role": "user", "content": "q"}], "tools": TOOLS, "stop": ["STOP"]}
+    before, _ = run(make_app(pieces, ""), copy.deepcopy(body))
+    assert before["finish"] == "stop" and before["calls"] is None and "STOP" in before["content"]
+    monkeypatch.setenv("GLM53_TF_TOOL_FIXES", "opencalls")
+    result, _ = run(make_app(pieces, "opencalls"), copy.deepcopy(body))
+    assert result["finish"] == "tool_calls" and args(result["calls"][0]) == {"message": "say STOP"}
+
+
+@open_call
+def test_close_glm_call():
+    close = server.close_glm_call
+    assert close("text", TOOLS) == "" and close("<tool_call>get_weather", []) == ""
+    assert close("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Pa", TOOLS) == "</arg_value></tool_call>"
+    assert close("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Pa</arg_value>\n", TOOLS) == "</tool_call>"
+    assert close("<tool_call>GET_WEATHER", TOOLS) == "</tool_call>"                     # names match as the parser's
+    assert close("<tool_call>get_weather</tool_call> done", TOOLS) == ""                # closed: not inside a call
+    assert close("<tool_call>get_weather<arg_key>city</arg_key><arg_value>a</think>b", TOOLS) == ""
+    assert close("<tool_call>get_weather\nmore", TOOLS) == ""
+
+
+@open_call
+def test_repair_glm_keys():
+    fix = server.repair_glm_keys
+    assert fix("read path</arg_key><arg_value>/x</arg_value>") == "read <arg_key>path</arg_key><arg_value>/x</arg_value>"
+    assert fix("read<arg_key>path</arg_key><arg_value>/x</arg_value>\nmode</arg_key><arg_value>r</arg_value>") == \
+        "read<arg_key>path</arg_key><arg_value>/x</arg_value>\n<arg_key>mode</arg_key><arg_value>r</arg_value>"
+    whole = "read<arg_key>path</arg_key><arg_value>/x</arg_value>"
+    assert fix(whole) == whole                                                         # nothing missing
+    assert fix(" path</arg_key><arg_value>/x</arg_value>") == " path</arg_key><arg_value>/x</arg_value>"   # no name
+
+
+@open_call
+def test_argkeys_knob_in_the_parser(monkeypatch):
+    text = "<tool_call>read path</arg_key><arg_value>/x</arg_value>\nmode</arg_key><arg_value>r</arg_value></tool_call>"
+    content, calls = parse_tool_calls(text, READ)
+    assert calls is None and content == text                                          # before: markup as text
+    monkeypatch.setenv("GLM53_TF_TOOL_FIXES", "argkeys")
+    content, calls = parse_tool_calls(text, READ)
+    assert content == "" and calls[0]["function"]["name"] == "read" and args(calls[0]) == {"path": "/x", "mode": "r"}
+
+
+@open_call
+def test_open_call_with_a_lost_key(monkeypatch):
+    pieces = ["<tool_call>", "read", " path", "</arg_key>", "<arg_value>", "/x", "<|observation|>"]
+    body = {"messages": [{"role": "user", "content": "q"}], "tools": READ}
+    monkeypatch.setenv("GLM53_TF_TOOL_FIXES", "opencalls")
+    result, _ = run(make_app(pieces, "opencalls"), copy.deepcopy(body))
+    assert result["calls"] is None                                                    # without argkeys: not a call
+    monkeypatch.setenv("GLM53_TF_TOOL_FIXES", "opencalls,argkeys")
+    result, _ = run(make_app(pieces, "opencalls,argkeys"), copy.deepcopy(body))
+    assert result["finish"] == "tool_calls" and args(result["calls"][0]) == {"path": "/x"}

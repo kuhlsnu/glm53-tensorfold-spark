@@ -233,8 +233,9 @@ tester's misses; the `args` fix is robustness only.
 
 ### 4.1 Patch 0620 `glm-tool-calling` (implemented; host only; off by default)
 
-`GLM53_TF_TOOL_FIXES` is a comma list. `all` means `history,reasoning,choice,args,thinkcalls`; `grammar` must be named
-explicitly. Files:
+`GLM53_TF_TOOL_FIXES` is a comma list. `all` means `history,reasoning,choice,args,thinkcalls`, plus patch 0690's
+`opencalls,argkeys` (docs/PATCHES.md, 0690: a GLM call the end token left open, a lost `<arg_key>`); `grammar`
+must be named explicitly. Files:
 - `patches/0620-glm-tool-calling.patch`: `cuda/server.py`, `glm5_next/cuda/{toolfix.py (new), app.py, grammar.py}`
 - tests: `tests/test_tool_fixes.py` (46 host tests)
 - patch notes: docs/PATCHES.md §0620
